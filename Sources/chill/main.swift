@@ -1,260 +1,227 @@
 import Foundation
+import Darwin
+import Dispatch
+
+final class StressState: @unchecked Sendable {
+    var isRunning = true
+}
 
 @MainActor
-struct ChillApp {
-    private static func clearScreen() {
-        print("\u{001B}[2J\u{001B}[H")
+struct ChillDashboard {
+    private static var running = true
+    private static var cpuHistory: [Double] = Array(repeating: 0.0, count: 18)
+    private static var originalTermios = termios()
+    private static var refreshInterval: Double = 1.5
+    private static var sortMode: ProcessSortMode = .cpu
+    private static var sigintSource: DispatchSourceSignal?
+
+    private static func enableRawMode() {
+        tcgetattr(STDIN_FILENO, &originalTermios)
+        var raw = originalTermios
+        raw.c_lflag &= ~tcflag_t(ECHO | ICANON)
+        raw.c_cc.16 = 0
+        raw.c_cc.17 = 1
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
     }
 
-    private static func printBanner() {
-        print("""
-        \u{001B}[36m
-           _____ _    _ _____ _      _      
-          / ____| |  | |_   _| |    | |     
-         | |    | |__| | | | | |    | |     
-         | |    |  __  | | | | |    | |     
-         | |____| |  | |_| |_| |____| |____ 
-          \\_____|_|  |_|_____|______|______|
-        \u{001B}[0m
-        ❄️  \u{001B}[1mCHILL - macOS Thermal & Hardware Monitor\u{001B}[0m
-        ─────────────────────────────────────────────
-        """)
+    private static func disableRawMode() {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &originalTermios)
     }
 
-    static func start() {
-        let args = Array(CommandLine.arguments.dropFirst())
+    private static func setupTerminal() {
+        enableRawMode()
+        print("\u{001B}[?1049h\u{001B}[?25l", terminator: "")
+        fflush(stdout)
 
-        if let firstArg = args.first {
-            switch firstArg {
-            case "-s", "--status":
-                displaySnapshot()
-                return
-            case "-m", "--monitor":
-                liveMonitor()
-                return
-            case "-h", "--help":
-                printHelp()
-                return
-            default:
-                break
-            }
+        signal(SIGINT, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        source.setEventHandler {
+            cleanupAndExit()
         }
-
-        interactiveMenu()
+        source.resume()
+        sigintSource = source
     }
 
-    private static func printHelp() {
-        printBanner()
-        print("""
-        Uso:
-          chill [opción]
-
-        Opciones:
-          -s, --status    Muestra el estado térmico actual y sale
-          -m, --monitor   Inicia el panel continuo en tiempo real
-          -h, --help      Muestra esta ayuda
-
-        Sin argumentos inicia el menú interactivo.
-        """)
+    private static func cleanupAndExit() {
+        disableRawMode()
+        print("\u{001B}[?25h\u{001B}[?1049l", terminator: "")
+        fflush(stdout)
+        exit(0)
     }
 
-    private static func displaySnapshot() {
-        printBanner()
-        let sensors = SMCBridge.shared.getThermalSensors()
-        let fans = SMCBridge.shared.getFanSpeed()
-        let avgTemp = sensors.isEmpty ? 0.0 : (sensors.map(\.temperature).reduce(0, +) / Double(sensors.count))
-        let maxTemp = sensors.map(\.temperature).max() ?? 0.0
-
-        print("🌡️  TEMPERATURAS")
-        print(" • Media del SoC:  \u{001B}[32m\(String(format: "%.1f", avgTemp)) °C\u{001B}[0m")
-        print(" • Pico máximo:    \u{001B}[33m\(String(format: "%.1f", maxTemp)) °C\u{001B}[0m")
-        print("─────────────────────────────────────────────")
-        print("🌀 VENTILADORES")
-        if fans.isEmpty {
-            print(" • 0 RPM (Modo Pasivo / Silencioso de macOS)")
-        } else {
-            for fan in fans {
-                print(" • Ventilador #\(fan.id): \(fan.currentRPM) RPM")
-            }
-        }
-        print("─────────────────────────────────────────────\n")
+    private static func makeBar(percentage: Double, length: Int = 16) -> String {
+        let cleanPercent = max(0.0, min(100.0, percentage))
+        let filledCount = Int((cleanPercent / 100.0) * Double(length))
+        let emptyCount = max(0, length - filledCount)
+        let colorCode = cleanPercent < 55.0 ? "\u{001B}[32m" : (cleanPercent < 80.0 ? "\u{001B}[33m" : "\u{001B}[31m")
+        return "\(colorCode)\(String(repeating: "▰", count: filledCount))\u{001B}[90m\(String(repeating: "▱", count: emptyCount))\u{001B}[0m"
     }
 
-    private static func interactiveMenu() {
-        while true {
-            clearScreen()
-            printBanner()
-            print("""
-            \u{001B}[1m[ MENÚ PRINCIPAL ]\u{001B}[0m
+    private static func makeSparkline(history: [Double]) -> String {
+        let ticks = [" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        return history.map { val in
+            let index = min(7, max(0, Int((val / 100.0) * 8.0)))
+            return ticks[index]
+        }.joined()
+    }
 
-            1.  Ver Estado Térmico y Sensores
-            2.  Monitor Continuo en Tiempo Real
-            3.  Test de Respuesta Térmica (Carga de CPU)
-            4.  Acerca de Chill
-            0.  Salir
-
-            """)
-            print(" Selecciona una opción [0-4]: ", terminator: "")
-
-            guard let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+    private static func visibleLength(of text: String) -> Int {
+        var stripped = ""
+        var inAnsi = false
+        for char in text {
+            if char == "\u{001B}" { inAnsi = true; continue }
+            if inAnsi {
+                if char.isLetter { inAnsi = false }
                 continue
             }
-
-            switch input {
-            case "1":
-                showDetailedTelemetry()
-            case "2":
-                liveMonitor()
-            case "3":
-                runStressTest()
-            case "4":
-                aboutMenu()
-            case "0":
-                clearScreen()
-                print("👋 ¡Hasta luego! Mantén tu Mac fresco ❄️\n")
-                exit(0)
-            default:
-                print("\n❌ Opción no válida. Presiona Enter para continuar...")
-                _ = readLine()
-            }
+            stripped.append(char)
         }
+        return stripped.utf16.count
     }
 
-    private static func showDetailedTelemetry() {
-        while true {
-            clearScreen()
-            printBanner()
-
-            let sensors = SMCBridge.shared.getThermalSensors()
-            let fans = SMCBridge.shared.getFanSpeed()
-            let avgTemp = sensors.isEmpty ? 0.0 : (sensors.map(\.temperature).reduce(0, +) / Double(sensors.count))
-            let maxTemp = sensors.map(\.temperature).max() ?? 0.0
-
-            print("""
-            \u{001B}[1m[ 🌀 TELEMETRÍA DEL SISTEMA ]\u{001B}[0m
-
-            🌡️  Temperatura Media SoC: \u{001B}[32m\(String(format: "%.1f", avgTemp)) °C\u{001B}[0m | Pico Máx: \u{001B}[33m\(String(format: "%.1f", maxTemp)) °C\u{001B}[0m
-            """)
-
-            if fans.isEmpty {
-                print(" 🌀 Ventiladores: \u{001B}[34m0 RPM (Modo Pasivo / Silencioso)\u{001B}[0m")
-            } else {
-                for fan in fans {
-                    print(" 🌀 Ventilador #\(fan.id): \u{001B}[32m\(fan.currentRPM) RPM\u{001B}[0m")
-                }
-            }
-
-            print("""
-            ─────────────────────────────────────────────
-            SENSORES ACTIVOS (HID):
-            """)
-            for (idx, s) in sensors.prefix(8).enumerated() {
-                print(" [\(idx + 1)] \(s.name.padding(toLength: 18, withPad: " ", startingAt: 0)): \(String(format: "%.1f", s.temperature)) °C")
-            }
-
-            print("""
-            ─────────────────────────────────────────────
-            1.  Actualizar datos
-            0.  Volver al menú principal
-
-            """)
-            print(" Selecciona una opción [0-1]: ", terminator: "")
-
-            guard let choice = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else { continue }
-            if choice == "1" { continue }
-            if choice == "0" { return }
-        }
+    private static func padCol(_ text: String, width: Int) -> String {
+        let visLen = visibleLength(of: text)
+        let spaces = max(0, width - visLen)
+        return text + String(repeating: " ", count: spaces)
     }
 
-    private static func liveMonitor() {
-        clearScreen()
-        print("❄️  Iniciando monitor en tiempo real (Presiona Ctrl+C para volver)...\n")
-        Thread.sleep(forTimeInterval: 0.8)
+    private static func render(cpu: CPUUsage, mem: MemoryUsage, sensors: [ThermalSensor], fans: [FanStatus], processes: [ProcessItem], batt: BatteryStatus, net: (down: String, up: String)) {
+        
+        cpuHistory.removeFirst()
+        cpuHistory.append(cpu.totalUsage)
 
-        while true {
-            clearScreen()
-            printBanner()
-            let sensors = SMCBridge.shared.getThermalSensors()
-            let fans = SMCBridge.shared.getFanSpeed()
-            let avgTemp = sensors.isEmpty ? 0.0 : (sensors.map(\.temperature).reduce(0, +) / Double(sensors.count))
-            let maxTemp = sensors.map(\.temperature).max() ?? 0.0
+        let avgTemp = sensors.isEmpty ? 0.0 : (sensors.map(\.temperature).reduce(0, +) / Double(sensors.count))
+        let maxTemp = sensors.map(\.temperature).max() ?? 0.0
+        let thermalHeadroom = max(0.0, 100.0 - maxTemp)
+        let headroomPercent = (thermalHeadroom / 60.0) * 100.0
+        
+        let isDesktop = batt.percentage == 100 && batt.cycleCount == 0 && batt.health == 100
+        let battIcon = batt.isCharging ? "⚡️" : "🔋"
+        let sortLabel = sortMode == .cpu ? "% CPU" : "% RAM"
 
-            print("🌡️  Media SoC: \u{001B}[32m\(String(format: "%.1f", avgTemp)) °C\u{001B}[0m | Pico: \u{001B}[33m\(String(format: "%.1f", maxTemp)) °C\u{001B}[0m")
+        var buffer = "\u{001B}[H"
+        buffer += """
+        \u{001B}[36m
+          ░█████╗░██╗░░██╗██╗██╗░░░░░██╗░░░░░
+          ██╔══██╗██║░░██║██║██║░░░░░██║░░░░░
+          ██║░░╚═╝███████║██║██║░░░░░██║░░░░░
+          ██║░░██╗██╔══██║██║██║░░░░░██║░░░░░
+          ╚█████╔╝██║░░██║██║███████╗███████╗
+          ░╚════╝░╚═╝░░╚═╝╚═╝╚══════╝╚══════╝\u{001B}[0m
+        \u{001B}[36m┌─── TELEMETRY & HARDWARE MONITOR ───────────────────────────── [ macOS ] ──────┐\u{001B}[0m\n
+        """
 
-            if fans.isEmpty {
-                print("🌀 Ventiladores: \u{001B}[34m0 RPM (Silencioso)\u{001B}[0m\n")
-            } else {
-                let fanList = fans.map { "#\($0.id): \($0.currentRPM) RPM" }.joined(separator: " | ")
-                print("🌀 Ventiladores: \u{001B}[32m\(fanList)\u{001B}[0m\n")
+        let headerText = "  \u{001B}[1m❄️  APPLE SILICON DASHBOARD\u{001B}[0m           Uptime: \(cpu.uptimeString.padding(toLength: 8, withPad: " ", startingAt: 0)) Refresh: \(String(format: "%.1f", refreshInterval))s"
+        buffer += "│" + padCol(headerText, width: 78) + "  │\n"
+        
+        buffer += "\u{001B}[36m├─── CPU & RESOURCES ────────────────────────┬─── THERMALS & COOLING ───────────┤\u{001B}[0m\n"
+
+        buffer += "│" + padCol("  CPU Load:  [\(makeBar(percentage: cpu.totalUsage))] \(String(format: "%5.1f", cpu.totalUsage))%", width: 44) + "│" + padCol("  SoC Avg:      \u{001B}[32m\(String(format: "%5.1f", avgTemp)) °C\u{001B}[0m", width: 33) + " │\n"
+        buffer += "│" + padCol("  History:   \u{001B}[36m\(makeSparkline(history: cpuHistory))\u{001B}[0m", width: 44) + "│" + padCol("  Peak Temp:    \u{001B}[33m\(String(format: "%5.1f", maxTemp)) °C\u{001B}[0m", width: 33) + " │\n"
+        buffer += "│" + padCol("  Topology:  \(cpu.coreCount) Active Cores", width: 44) + "│" + padCol("  Headroom:     [\(makeBar(percentage: headroomPercent, length: 8))] \(String(format: "%4.1f", thermalHeadroom))°C", width: 33) + " │\n"
+
+        buffer += "\u{001B}[36m├─── UNIFIED MEMORY & NETWORK ───────────────┼─── BATTERY & FANS ───────────────┤\u{001B}[0m\n"
+        
+        buffer += "│" + padCol("  RAM Usage: [\(makeBar(percentage: mem.percentage))] \(String(format: "%5.1f", mem.percentage))%", width: 44) + "│" + padCol("  Fan State: " + (fans.isEmpty ? "\u{001B}[34m0 RPM (Silent Mode)\u{001B}[0m" : "\u{001B}[32m\(fans[0].currentRPM) RPM\u{001B}[0m"), width: 33) + " │\n"
+        buffer += "│" + padCol("  Allocated: \(String(format: "%4.1f", mem.usedGB)) / \(String(format: "%4.1f", mem.totalGB)) GB", width: 44) + "│" + padCol(isDesktop ? "  Battery:   AC Power (Desktop)" : "  Battery:   [\(makeBar(percentage: Double(batt.percentage), length: 8))] \(batt.percentage)% \(battIcon)", width: 33) + " │\n"
+        buffer += "│" + padCol("  App: \(String(format: "%3.1f", mem.appGB))G | Wired: \(String(format: "%3.1f", mem.wiredGB))G | Comp: \(String(format: "%3.1f", mem.compressedGB))G", width: 44) + "│" + padCol(isDesktop ? "  Health:    N/A" : "  Health:    \(batt.health)% (\(batt.cycleCount) Cycles)", width: 33) + " │\n"
+        buffer += "│" + padCol("  Live Net:  ↓ \(net.down.padding(toLength: 8, withPad: " ", startingAt: 0)) | ↑ \(net.up)", width: 44) + "│" + padCol("  Fan Curve: Native macOS (Auto)", width: 33) + " │\n"
+
+        buffer += "\u{001B}[36m├─── TOP PROCESSES [ Sort: \(sortLabel) ] ─────────────────────────────────────────────┤\u{001B}[0m\n"
+
+        if processes.isEmpty {
+            buffer += "│" + padCol("  No active processes found", width: 78) + " │\n"
+        } else {
+            for proc in processes {
+                let badge = proc.cpuPercent > 50.0 ? "🔴" : (proc.cpuPercent >= 15.0 ? "🟠" : "🟢")
+                let color = proc.cpuPercent > 50.0 ? "\u{001B}[31m" : (proc.cpuPercent >= 15.0 ? "\u{001B}[33m" : "\u{001B}[32m")
+                let pidStr = "[\(proc.pid)]".padding(toLength: 7, withPad: " ", startingAt: 0)
+                let nameStr = proc.name.prefix(22).padding(toLength: 23, withPad: " ", startingAt: 0)
+                let metricStr = sortMode == .cpu 
+                    ? String(format: "%5.1f%% CPU", proc.cpuPercent)
+                    : String(format: "%5.1f%% RAM", proc.memPercent)
+                
+                let procLine = "  \(badge)  \(pidStr) \(nameStr) \(color)\(metricStr)\u{001B}[0m"
+                buffer += "│" + padCol(procLine, width: 78) + " │\n"
             }
-
-            print("Sensores activos:")
-            for (idx, s) in sensors.prefix(8).enumerated() {
-                print(" [\(idx + 1)] \(s.name.padding(toLength: 18, withPad: " ", startingAt: 0)): \(String(format: "%.1f", s.temperature)) °C")
-            }
-            print("\nRefresco cada 2 segundos... (Ctrl+C para salir)")
-            Thread.sleep(forTimeInterval: 2.0)
         }
+        
+        buffer += "\u{001B}[36m├───────────────────────────────────────────────────────────────────────────────┤\u{001B}[0m\n"
+        let footerText = "  [Q/X] Exit  [P] Sort: CPU/RAM  [+/-] Refresh  [S] Stress 3s"
+        buffer += "│" + padCol(footerText, width: 78) + " │\n"
+        buffer += "\u{001B}[36m└───────────────────────────────────────────────────────────────────────────────┘\u{001B}[0m"
+        
+        print(buffer, terminator: "")
+        fflush(stdout)
     }
 
-    private static func runStressTest() {
-        clearScreen()
-        printBanner()
-        print("""
-        \u{001B}[1m[ 🔥 TEST DE RESPUESTA TÉRMICA ]\u{001B}[0m
-
-        Carga controlada de CPU durante 10 segundos para observar cómo 
-        sube la temperatura en tus sensores en tiempo real.
-
-        Presiona Enter para iniciar (o '0' para cancelar)...
-        """)
-        if let input = readLine(), input.trimmingCharacters(in: .whitespacesAndNewlines) == "0" {
-            return
+    private static func readKeyNonBlocking() -> Character? {
+        var byte: UInt8 = 0
+        let res = read(STDIN_FILENO, &byte, 1)
+        if res > 0 {
+            return Character(UnicodeScalar(byte))
         }
+        return nil
+    }
 
-        print("\n🔥 Ejecutando cálculo multinúcleo...")
-        var isRunning = true
+    private static func runMiniStress() {
+        let state = StressState()
         let group = DispatchGroup()
         let cores = ProcessInfo.processInfo.activeProcessorCount
 
         for _ in 0..<cores {
             group.enter()
             DispatchQueue.global(qos: .userInteractive).async {
-                while isRunning {
+                while state.isRunning {
                     _ = (0..<1000).reduce(0, +)
                 }
                 group.leave()
             }
         }
 
-        for sec in (1...10).reversed() {
-            let sensors = SMCBridge.shared.getThermalSensors()
-            let avgTemp = sensors.isEmpty ? 0.0 : (sensors.map(\.temperature).reduce(0, +) / Double(sensors.count))
-            print(" ⏱️  Tiempo restante: \(sec)s | Temperatura SoC: \u{001B}[33m\(String(format: "%.1f", avgTemp)) °C\u{001B}[0m")
-            Thread.sleep(forTimeInterval: 1.0)
-        }
-
-        isRunning = false
+        Thread.sleep(forTimeInterval: 3.0)
+        state.isRunning = false
         group.wait()
-
-        print("\n✅ Prueba terminada. Presiona Enter para volver...")
-        _ = readLine()
     }
 
-    private static func aboutMenu() {
-        clearScreen()
-        printBanner()
-        print("""
-        \u{001B}[1m[ ACERCA DE CHILL ]\u{001B}[0m
+    static func start() {
+        _ = SystemMetrics.shared.getCPUUsage() 
+        setupTerminal()
 
-        • Versión:     1.0.0 (Open Source)
-        • Plataforma:  macOS (Apple Silicon & Intel)
-        • Telemetría:  IOHIDEventSystem Native Client
+        while running {
+            let cpu = SystemMetrics.shared.getCPUUsage()
+            let mem = SystemMetrics.shared.getMemoryUsage()
+            let sensors = SMCBridge.shared.getThermalSensors()
+            let fans = SMCBridge.shared.getFanSpeed()
+            let procs = SystemMetrics.shared.getTopProcesses(limit: 5, sortBy: sortMode)
+            let batt = SystemMetrics.shared.getBatteryStatus()
+            let net = SystemMetrics.shared.getNetworkSpeed()
 
-        Presiona Enter para volver al menú principal...
-        """)
-        _ = readLine()
+            render(cpu: cpu, mem: mem, sensors: sensors, fans: fans, processes: procs, batt: batt, net: net)
+
+            let slices = Int(refreshInterval * 10)
+            for _ in 0..<max(1, slices) {
+                if let key = readKeyNonBlocking() {
+                    switch key {
+                    case "q", "Q", "x", "X":
+                        cleanupAndExit()
+                    case "p", "P":
+                        sortMode = (sortMode == .cpu) ? .memory : .cpu
+                    case "+", "=":
+                        refreshInterval = min(5.0, refreshInterval + 0.5)
+                    case "-", "_":
+                        refreshInterval = max(0.5, refreshInterval - 0.5)
+                    case "s", "S":
+                        runMiniStress()
+                    default:
+                        break
+                    }
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+        }
     }
 }
 
-ChillApp.start()
+ChillDashboard.start()

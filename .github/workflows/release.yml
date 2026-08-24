@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Release Binary
+        run: |
+          swift build -c release --arch arm64 --arch x86_64
+          cp .build/apple/Products/Release/chill chill
+          tar -czf chill-macos.tar.gz chill
+          shasum -a 256 chill-macos.tar.gz > chill-macos.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            chill-macos.tar.gz
+            chill-macos.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

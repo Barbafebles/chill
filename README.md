@@ -1,32 +1,42 @@
 # ❄️ Chill
 
-A lightweight, native macOS CLI tool to monitor system thermals and hardware sensors in real time, built in Swift for Apple Silicon and Intel Macs.
+A sleek, lightweight, and native macOS CLI hardware and telemetry monitor built entirely in Swift for Apple Silicon and Intel Macs.
 
 ```text
-   _____ _    _ _____ _      _      
-  / ____| |  | |_   _| |    | |     
- | |    | |__| | | | | |    | |     
- | |    |  __  | | | | |    | |     
- | |____| |  | |_| |_| |____| |____ 
-  \_____|_|  |_|_____|______|______|
+  ░█████╗░██╗░░██╗██╗██╗░░░░░██╗░░░░░
+  ██╔══██╗██║░░██║██║██║░░░░░██║░░░░░
+  ██║░░╚═╝███████║██║██║░░░░░██║░░░░░
+  ██║░░██╗██╔══██║██║██║░░░░░██║░░░░░
+  ╚█████╔╝██║░░██║██║███████╗███████╗
+  ░╚════╝░╚═╝░░╚═╝╚═╝╚══════╝╚══════╝
 
 ```
 
+---
+
 ## ✨ Features
 
-* **Interactive CLI Dashboard:** Clean terminal UI with ASCII banner and menu-driven navigation.
-* **SoC & Silicon Telemetry:** Direct sensor telemetry via macOS `IOHIDEventSystem` (ApplePMU / RTBuddy).
-* **Live Monitor Mode:** Continuous terminal dashboard refreshing every 2 seconds.
-* **Thermal Stress Test:** Built-in multi-core CPU load tester to observe real-time thermal response.
-* **Zero Heavy Dependencies:** Native Swift implementation with minimal memory and CPU footprint.
+* **Cyberpunk / Retro ASCII TUI:** Zero-flicker native terminal interface using ANSI alternate screen buffers and raw keyboard mode.
+* **CPU & Sparklines:** Real-time multi-core CPU tracking with historical ASCII sparklines (` ▂▃▄▅▆▇█`).
+* **Silicon Telemetry & Thermal Headroom:** Direct SoC die temperature readings via private `IOHIDEventSystem` APIs, calculating real-time thermal headroom before throttling.
+* **Unified Memory & Network I/O:** Breakdown of App, Wired, and Compressed RAM alongside live network download/upload throughput.
+* **Battery Health & Cycles:** Native AppleSmartBattery IOKit telemetry showing battery capacity, health percentage, and total cycle count.
+* **Interactive Process Monitor:** Top resource-hogging processes with dynamic colored badges (🟢, 🟠, 🔴) and hot-swappable sorting.
+* **Interactive Keyboard Controls:**
+* `[Q / X]` Clean exit and terminal restoration.
+* `[P]` Toggle process ordering between **% CPU** and **% RAM**.
+* `[+ / -]` Dynamically adjust refresh rate in 0.5s steps.
+* `[S]` Trigger an instant 3-second multi-threaded CPU stress test.
+
+
 
 ---
 
 ## 🚀 Installation
 
-### Option 1: Quick Install (Direct Binary)
+### Option 1: Global Binary (Recommended)
 
-Clone the repository, build the release binary, and move it to your local path:
+Clone the repository, compile the release build, and copy it to your local system path:
 
 ```bash
 git clone https://github.com/Barbafebles/chill.git
@@ -36,7 +46,14 @@ sudo cp .build/release/chill /usr/local/bin/
 
 ```
 
-### Option 2: Run via Swift Package Manager
+Now you can run `chill` directly from any terminal session:
+
+```bash
+chill
+
+```
+
+### Option 2: Swift Package Manager (Local Run)
 
 ```bash
 git clone https://github.com/Barbafebles/chill.git
@@ -47,55 +64,26 @@ swift run chill
 
 ---
 
-## 📖 Usage
+## ⌨️ Interactive Shortcuts
 
-### Interactive Menu
+While running `chill`, press any of the following keys without pressing Enter:
 
-Run `chill` without flags to launch the interactive terminal interface:
-
-```bash
-chill
-
-```
-
-### Quick Commands
-
-* **Instant status snapshot:**
-```bash
-chill --status
-# or
-chill -s
-
-```
-
-
-* **Live continuous monitoring:**
-```bash
-chill --monitor
-# or
-chill -m
-
-```
-
-
-* **Display help:**
-```bash
-chill --help
-
-```
-
-
+| Key | Action |
+| --- | --- |
+| **`Q`** / **`X`** | Exit application cleanly |
+| **`P`** | Toggle Top Apps sorting (**CPU%** ⟷ **RAM%**) |
+| **`+`** / **`-`** | Increase / decrease dashboard refresh interval |
+| **`S`** | Run an inline 3-second CPU stress test |
 
 ---
 
 ## 🛠️ Architecture & Under the Hood
 
-Unlike legacy Intel Macs that relied entirely on structural `AppleSMC` calls, modern Apple Silicon SoCs (M-Series) route power management and thermal sensors through the internal **Core-Level Power Control (CLPC)** and **RTBuddy** coprocessor.
+Unlike traditional cross-platform monitors that rely on heavy dependencies or generic POSIX wrappers, **`chill`** interfaces directly with low-level macOS subsystems:
 
-`chill` interfaces directly with macOS private `IOHIDEventSystem` APIs to read:
-
-* **SoC die & PMU thermal points:** Real-time sensor temperatures (CPU, GPU, NAND, PMU).
-* **Cooling telemetry:** Active RPM monitoring and dynamic passive cooling state detection.
+* **`IOHIDEventSystem` & `AppleSMC` Bridge:** Direct access to PMU and RTBuddy sensor arrays.
+* **`IOKit` Battery Registry:** Hardware-level inspection of battery health and cycle count.
+* **`Mach Kernel APIs` (`host_processor_info` / `host_statistics64`):** Precise CPU load and unified memory telemetry with negligible resource footprint.
 
 ---
 
